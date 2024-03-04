@@ -9,8 +9,7 @@ import (
 	"sync"
 	"time"
 
-	badger "github.com/dgraph-io/badger/v2"
-	options "github.com/dgraph-io/badger/v2/options"
+	badger "github.com/dgraph-io/badger/v4"
 	ds "github.com/ipfs/go-datastore"
 	dsq "github.com/ipfs/go-datastore/query"
 	logger "github.com/ipfs/go-log/v2"
@@ -141,24 +140,6 @@ func init() {
 	// read-only and efficiently queried. We don't do that and hanging on
 	// stop isn't nice.
 	DefaultOptions.Options.CompactL0OnClose = false
-
-	// The alternative is "crash on start and tell the user to fix it". This
-	// will truncate corrupt and unsynced data, which we don't guarantee to
-	// persist anyways.
-	DefaultOptions.Options.Truncate = true
-
-	// Uses less memory, is no slower when writing, and is faster when
-	// reading (in some tests).
-	DefaultOptions.Options.ValueLogLoadingMode = options.FileIO
-
-	// Explicitly set this to mmap. This doesn't use much memory anyways.
-	DefaultOptions.Options.TableLoadingMode = options.MemoryMap
-
-	// Reduce this from 64MiB to 16MiB. That means badger will hold on to
-	// 20MiB by default instead of 80MiB.
-	//
-	// This does not appear to have a significant performance hit.
-	DefaultOptions.Options.MaxTableSize = 16 << 20
 }
 
 var _ ds.Datastore = (*Datastore)(nil)
@@ -216,6 +197,46 @@ func NewDatastore(path string, options *Options) (*Datastore, error) {
 
 	ds := &Datastore{
 		DB:             kv,
+		closing:        make(chan struct{}),
+		gcDiscardRatio: gcDiscardRatio,
+		gcSleep:        gcSleep,
+		gcInterval:     gcInterval,
+		syncWrites:     opt.SyncWrites,
+		ttl:            ttl,
+	}
+
+	// Start the GC process if requested.
+	if ds.gcInterval > 0 {
+		go ds.periodicGC()
+	}
+
+	return ds, nil
+}
+
+// NewDatastoreFromDB creates a new badger datastore from an existing badger db.
+//
+// DO NOT set the Dir and/or ValuePath fields of opt, they will be set for you.
+func NewDatastoreFromDB(db *badger.DB) (*Datastore, error) {
+	// Copy the options because we modify them.
+	var opt badger.Options
+	var gcDiscardRatio float64
+	var gcSleep time.Duration
+	var gcInterval time.Duration
+	var ttl time.Duration
+	opt = DefaultOptions.Options
+	gcDiscardRatio = DefaultOptions.GcDiscardRatio
+	gcSleep = DefaultOptions.GcSleep
+	gcInterval = DefaultOptions.GcInterval
+	ttl = DefaultOptions.TTL
+
+	if gcSleep <= 0 {
+		// If gcSleep is 0, we don't perform multiple rounds of GC per
+		// cycle.
+		gcSleep = gcInterval
+	}
+
+	ds := &Datastore{
+		DB:             db,
 		closing:        make(chan struct{}),
 		gcDiscardRatio: gcDiscardRatio,
 		gcSleep:        gcSleep,
